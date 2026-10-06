@@ -1,0 +1,188 @@
+"""SR-VA: the Van Atta structure-function method.
+
+Rather than finding individual ramps, Van Atta (1977) fits an idealised ramp model to the
+scalar's structure functions. For increments ``inc(r) = x(t+r) - x(t)`` and
+``Sn = <inc^n>``, the ramp amplitude ``A`` solves the cubic
+
+    A^3 + p A + q = 0 ,     p = 10 S2 - S5/S3 ,     q = 10 S3
+
+and the total ramp period follows as ``tau = A^2 r / S2``. The root is chosen to match
+sign(S3), which is what ties the amplitude to the flux direction: a warm ramp rises slowly
+and collapses sharply, giving S3 < 0.
+
+Lag selection matters more than anything else here. A fixed 1 s lag is the textbook choice
+for a 20 Hz sonic but collapses on a canopy skin temperature, whose ramps carry almost no
+1 s signal. The Chen et al. (1997) criterion adapts the lag per block from the first global
+maximum of |S3(r)|/r. Sweep the lag on a calibration window rather than assuming a default.
+
+References
+----------
+Van Atta (1977) Arch. Mech. 29, 161-171.
+Chen, Novak, Black & Lee (1997) Boundary-Layer Meteorol. 84, 99-124 -- ramp model with
+finite microfront time; the lag criterion.
+Castellvi (2004) Water Resour. Res. 40, W05201; Shapland et al. (2012b)
+Boundary-Layer Meteorol. 145, 5-25 -- structure-function surface renewal in practice.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+from .base import RampStats
+
+RMAX_S = 120.0
+
+
+def structure_functions(x: np.ndarray, r: int) -> tuple[float, float, float]:
+    """Second, third and fifth order structure functions at integer lag ``r`` [samples]."""
+    inc = x[r:] - x[:-r]
+    inc2 = inc * inc
+    return (float(inc2.mean()), float((inc2 * inc).mean()),
+            float((inc2 * inc2 * inc).mean()))
+
+
+def solve_cubic(x: np.ndarray, r: int) -> tuple[float, float]:
+    """Van Atta amplitude and period at lag ``r``; returns ``(A, tau_samples)``.
+
+    Cardano's formula, taking the real root whose sign matches S3 when three real roots
+    exist. Root selection matters: picking per-lag roots without the sign constraint makes
+    the solution bifurcate between branches and destroys the correlation with the flux.
+    """
+    # a lag beyond a quarter of the block leaves too few increment pairs for the
+    # fifth-order moment to mean anything
+    if r < 1 or r >= len(x) // 4:
+        return (float("nan"), float("nan"))
+    S2, S3, S5 = structure_functions(x, r)
+    # S3 divides into p, and it is also what carries the ramp asymmetry: a block
+    # with S3 = 0 has no resolvable ramp direction
+    if S3 == 0 or not np.isfinite(S3):
+        return (float("nan"), float("nan"))
+
+    p = 10 * S2 - S5 / S3
+    q = 10 * S3
+    disc = (q / 2) ** 2 + (p / 3) ** 3
+    if disc >= 0:
+        # one real root: Cardano's formula directly
+        sd = np.sqrt(disc)
+        A = np.cbrt(-q / 2 + sd) + np.cbrt(-q / 2 - sd)
+    else:
+        # three real roots: the trigonometric form. Choosing among them is not a
+        # formality -- taking an arbitrary root per lag makes the solution jump
+        # between branches from block to block and destroys the correlation with
+        # the flux, so the root must share the sign of S3.
+        m = np.sqrt(-((p / 3) ** 3))
+        th = np.arccos(np.clip(-q / (2 * m), -1, 1))
+        roots = [2 * np.cbrt(m) * np.cos((th + 2 * np.pi * k) / 3) for k in range(3)]
+        same = [rt for rt in roots if np.sign(rt) == np.sign(S3)]
+        # no root matches the sign: fall back to the smallest, the conservative
+        # choice, rather than inventing a large amplitude
+        A = same[0] if same else roots[int(np.argmin(np.abs(roots)))]
+
+    tau = (A ** 2 * r / S2) if (S2 > 0 and A != 0) else float("nan")
+    return (float(A), float(tau))
+
+
+def chen_lag(x: np.ndarray, fs: float = 1.0, rmax_s: float = RMAX_S) -> int:
+    """Chen et al. (1997) optimal lag: first global maximum of |S3(r)|/r.
+
+    ``rmax_s`` bounds the search in seconds.
+    """
+    n = len(x)
+    # bounded twice: by rmax_s on physical grounds, and by n//4 so the moment
+    # stays estimable
+    rmax = min(int(rmax_s * fs), n // 4)
+    if rmax < 1:
+        return 0
+    metric = np.full(rmax + 1, -np.inf)
+    for r in range(1, rmax + 1):
+        inc = x[r:] - x[:-r]
+        # |S3|/r rather than |S3|: S3 grows with lag, so without the 1/r the
+        # maximum would always land on the largest lag searched
+        metric[r] = abs(float((inc ** 3).mean())) / r
+    if not np.isfinite(metric[1:]).any():
+        return 0
+    # argmax over metric[1:] then +1, because lag 0 is not a candidate
+    return 1 + int(np.argmax(metric[1:]))
+
+
+class VanAttaDetector:
+    """Structure-function surface renewal (SR-VA).
+
+    Parameters
+    ----------
+    fs : float
+        Sampling frequency [Hz].
+    lag : {"chen", float}
+        ``"chen"`` selects the lag per block by the Chen criterion. A number is a fixed lag
+        in seconds, which is what ``period_mode="unit"`` normally wants (see below).
+    period_mode : {"fitted", "unit"}
+        ``"fitted"`` (default) reports the solved ramp period tau, giving the classical
+        flux form ``A/tau``. ``"unit"`` sets tau = 1 and reports the AMPLITUDE ALONE, so the
+        flux becomes ``rho cp z A`` and the whole ramp-duration factor is absorbed into the
+        calibration coefficient.
+
+        Use ``"unit"`` when the period is not estimable from the data -- above all on a
+        1 Hz radiometric skin temperature, where the fitted tau can swing by an order of
+        magnitude between blocks (15-324 s observed) so that dividing by it adds noise
+        rather than information.
+
+        The lag then has to be chosen on a calibration window: the Chen criterion optimises
+        |S3(r)|/r, which targets the period you have just decided to discard.
+
+        In this mode ``count`` is not meaningful and is reported as 1.
+    rmax_s : float
+        Ceiling of the Chen lag search [s]. Surface ramps need tens of seconds; beyond about
+        two minutes the increments stop being a ramp signal and become the diurnal trend.
+
+    Examples
+    --------
+    >>> from srflux.synthetic import ramp_series
+    >>> v = ramp_series(n=1800, period_s=60, amplitude=1.0, seed=0)
+    >>> res = VanAttaDetector(fs=1.0).detect(v)
+    >>> res.amplitude > 0 and res.period > 0
+    True
+    """
+
+    name = "van_atta"
+
+    def __init__(self, fs: float = 1.0, lag="chen", period_mode: str = "fitted",
+                 rmax_s: float = RMAX_S):
+        if period_mode not in ("fitted", "unit"):
+            raise ValueError("period_mode must be 'fitted' or 'unit'")
+        self.fs = float(fs)
+        self.lag = lag
+        self.period_mode = period_mode
+        self.rmax_s = float(rmax_s)
+
+    def detect(self, v) -> RampStats:
+        """Solve the Van Atta cubic on one prepared block."""
+        x = np.asarray(v, float)
+        block_s = len(x) / self.fs
+        if self.lag == "chen":
+            r = chen_lag(x, self.fs, self.rmax_s)
+        else:
+            r = max(1, int(round(float(self.lag) * self.fs)))
+        if r < 1:
+            return RampStats(0, float("nan"), float("nan"), self.name, {})
+
+        A, tau_samples = solve_cubic(x, r)
+        if not np.isfinite(A):
+            return RampStats(0, float("nan"), float("nan"), self.name,
+                             {"lag_s": r / self.fs})
+        extra = {"lag_s": r / self.fs, "signed_amplitude": A, "block_s": block_s,
+                 "period_mode": self.period_mode}
+
+        if self.period_mode == "unit":
+            # report the fitted tau as a diagnostic but do not use it: in this
+            # mode the ramp duration is deliberately folded into alpha instead
+            extra["tau_fitted"] = tau_samples / self.fs if np.isfinite(tau_samples) else float("nan")
+            return RampStats(1, abs(A), 1.0, self.name, extra)
+
+        if not np.isfinite(tau_samples) or tau_samples <= 0:
+            return RampStats(0, float("nan"), float("nan"), self.name, extra)
+        tau = tau_samples / self.fs
+        # Van Atta does not count fronts, so the count is back-derived from the
+        # period purely to keep the RampStats contract uniform across detectors
+        count = int(round(block_s / tau)) if tau > 0 else 0
+        # abs(A): the magnitude is the amplitude, and the direction is applied
+        # later from the sign module, never from the cubic root
+        return RampStats(count, abs(A), tau, self.name, extra)

@@ -1,0 +1,151 @@
+"""SR-WL: the Haar wavelet ramp-front detector.
+
+The microfront at the trailing edge of a surface-renewal ramp is a step in the scalar
+series, so detecting ramps is edge detection. Convolving the detrended block with a Haar
+step kernel of width ``scale_s`` turns each front into a local extremum of the coefficient
+series, and the ramp amplitude is read off as the median |coefficient| at those extrema.
+
+Threshold. A fixed absolute threshold does not travel between sites or scalars, because the
+ramp amplitude of a canopy skin temperature is an order of magnitude smaller than that of
+air temperature. The threshold is therefore sigma-RELATIVE, ``k * std(c)`` of the
+coefficient series itself, which makes the detector scale-free.
+
+Defaults. A 32 s kernel with ``k = 0.75`` sits in a broad flat optimum (20-48 s) for
+reproducing eddy-covariance H; neither is worth tuning per site.
+
+References
+----------
+Collineau & Brunet (1993) Boundary-Layer Meteorol. 65, 357-379 -- wavelet detection of
+coherent structures.
+Paw U, Qiu, Su, Watanabe & Brunet (1995) Agric. For. Meteorol. 74, 119-137 -- surface
+renewal for scalar fluxes.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+from ..preprocess import detrend
+from .base import RampStats
+
+HAAR_SCALE_S = 32.0
+HAAR_K = 0.75
+HAAR_DEDUP_S = 15.0
+HAAR_DETREND_S = 300.0
+
+
+def haar_kernel(scale_s: float, fs: float = 1.0) -> np.ndarray:
+    """Normalised Haar step kernel spanning ``scale_s`` seconds.
+
+    The two halves are +1/h and -1/h, so convolving a clean step of height ``a`` returns a
+    coefficient of magnitude ``a`` -- the coefficient IS the amplitude, in the scalar's own
+    units, with no further scaling.
+    """
+    h = max(1, int(round(scale_s * fs / 2)))
+    # dividing by h is what makes the coefficient an amplitude rather than a sum:
+    # each half averages, so a step of height a convolves to exactly a
+    return np.concatenate([np.ones(h), -np.ones(h)]) / h
+
+
+def _fronts(coef: np.ndarray, threshold: float, dedup: int) -> list[int]:
+    """Indices of local maxima of |coef| above ``threshold``, thinned by ``dedup`` samples.
+
+    Thinning keeps the LARGEST coefficient within each dedup window rather than the first,
+    so a front is not split into several detections by ringing on either side of it.
+    """
+    fronts: list[int] = []
+    last = -(10 ** 9)                 # sentinel: no front seen yet
+    a = np.abs(coef)
+    # skip the first and last two samples: the convolution edge is not a real
+    # extremum, and a[i-1]/a[i+1] would index out of the array
+    for i in range(2, len(coef) - 2):
+        # >= on the left and > on the right breaks ties consistently, so a flat
+        # top counts once rather than at every sample along it
+        if a[i] > threshold and a[i] >= a[i - 1] and a[i] > a[i + 1]:
+            if i - last < dedup:
+                # too close to the previous front: keep whichever is larger, so
+                # ringing on one side of a step cannot displace the step itself
+                if fronts and a[i] > a[fronts[-1]]:
+                    fronts[-1] = i
+                continue
+            fronts.append(i)
+            last = i
+    return fronts
+
+
+class HaarDetector:
+    """Sigma-relative Haar front picker (SR-WL).
+
+    Parameters
+    ----------
+    fs : float
+        Sampling frequency [Hz].
+    scale_s, k, dedup_s, detrend_s : float
+        Kernel width, sigma-relative threshold factor, minimum front spacing and high-pass
+        window, all in seconds except ``k``.
+    threshold : float, optional
+        Absolute threshold in scalar units. Setting it overrides the sigma-relative rule;
+        provided for reproducing older fixed-threshold analyses, not recommended otherwise.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from srflux.synthetic import ramp_series
+    >>> v = ramp_series(n=1800, period_s=60, amplitude=1.0, seed=0)
+    >>> det = HaarDetector(fs=1.0)
+    >>> res = det.detect(v)
+    >>> res.count > 10 and res.amplitude > 0
+    True
+    """
+
+    name = "haar"
+
+    def __init__(self, fs: float = 1.0, scale_s: float = HAAR_SCALE_S, k: float = HAAR_K,
+                 dedup_s: float = HAAR_DEDUP_S, detrend_s: float = HAAR_DETREND_S,
+                 threshold: float | None = None):
+        self.fs = float(fs)
+        self.scale_s = float(scale_s)
+        self.k = float(k)
+        self.dedup_s = float(dedup_s)
+        self.detrend_s = float(detrend_s)
+        self.threshold = threshold
+        self._kernel = haar_kernel(self.scale_s, self.fs)
+
+    def coefficients(self, v) -> np.ndarray:
+        """Haar coefficient series of the detrended block."""
+        d = detrend(np.asarray(v, float), self.detrend_s, self.fs)
+        return np.convolve(d, self._kernel, mode="same")
+
+    def detect(self, v) -> RampStats:
+        """Detect ramp fronts in one prepared block."""
+        v = np.asarray(v, float)
+        block_s = len(v) / self.fs
+        coef = self.coefficients(v)
+        finite = np.isfinite(coef)
+        # fewer than a minute of usable coefficients cannot support a threshold
+        # estimate, let alone a ramp count
+        if finite.sum() < 60:
+            return RampStats(0, float("nan"), float("nan"), self.name, {})
+
+        if self.threshold is not None:
+            thr = float(self.threshold)
+        else:
+            # sigma-relative: the threshold is set by this block's own
+            # variability, which is what lets the same k work on a 0.05 K skin
+            # temperature and a 2 K air temperature
+            sigma = float(np.std(coef[finite]))
+            if sigma <= 0:
+                return RampStats(0, float("nan"), float("nan"), self.name, {})
+            thr = self.k * sigma
+
+        dedup = max(1, int(round(self.dedup_s * self.fs)))
+        idx = _fronts(coef, thr, dedup)
+        if not idx:
+            return RampStats(0, float("nan"), float("nan"), self.name,
+                             {"threshold": thr})
+        # median, not mean: one spike from a bird landing on the sensor should
+        # not set the block's ramp amplitude
+        amp = float(np.median(np.abs(coef[idx])))
+        period = block_s / len(idx)
+        return RampStats(len(idx), amp, period, self.name,
+                         {"threshold": thr, "front_index": np.asarray(idx),
+                          "block_s": block_s})

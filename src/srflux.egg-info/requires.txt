@@ -1,0 +1,13 @@
+numpy>=1.20
+pandas>=1.3
+
+[dev]
+pytest>=7
+ruff
+
+[examples]
+matplotlib>=3.5
+jupyter
+
+[test]
+pytest>=7
